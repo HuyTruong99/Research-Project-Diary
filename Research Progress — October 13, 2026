@@ -1,0 +1,15 @@
+Today, I continued developing my AI-powered vision assistant by integrating Ray-Ban Meta smart glasses with YOLO11 object detection, OpenAI Vision LLM, and voice interaction using Python.
+
+I successfully implemented real-time object detection through the glasses' video feed and connected the system to an OpenAI vision model capable of interpreting captured images and answering natural-language questions.
+
+During development, I resolved several technical issues involving ONNX model compatibility, Python dependencies, API authentication, and microphone integration using PyAudioWPatch.
+
+I also implemented automatic scene narration and worked on improving text-to-speech playback so the AI can respond verbally to multiple questions. Repeated voice playback is still being tested.
+
+The next goal is to enable hands-free voice interaction, improve object localization, and eventually integrate the vision system with the Epson VT6 robotic arm for assistive robotics applications.
+
+Current status: Real-time YOLO detection and LLM image understanding are working. Voice interaction is implemented and undergoing further testing. Robot movement remains disabled.
+
+
+C:\Users\HuyTr\OneDrive\Desktop\AIvisionEpsonRoboticarm\rayban_yolo_llm_voice_pyaudiowpatch.py
+C:\Users\HuyTr\OneDrive\Desktop\AIvisionEpsonRoboticarm\Testai.py

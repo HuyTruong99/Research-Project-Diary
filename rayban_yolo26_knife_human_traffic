@@ -1,0 +1,1237 @@
+"""
+Ray-Ban Meta Glasses + YOLO26 ONNX + OpenAI LLM + Voice
+Windows / Python 3.14
+
+S = Describe scene
+K = Assess experimental knife danger
+Epson VT6 robot movement is DISABLED.
+"""
+
+import os
+import sys
+import time
+import base64
+import json
+import math
+from datetime import datetime, timezone
+import subprocess
+from pathlib import Path
+from collections import Counter, deque
+
+import cv2
+import mss
+import numpy as np
+import onnxruntime as ort
+from openai import OpenAI
+
+# ---------------------------------------------------
+# MICROPHONE: PYAUDIOWPATCH
+# ---------------------------------------------------
+
+try:
+    import pyaudiowpatch as pyaudio
+    sys.modules["pyaudio"] = pyaudio
+    AUDIO_BACKEND = "PyAudioWPatch"
+except ImportError:
+    try:
+        import pyaudio
+        AUDIO_BACKEND = "PyAudio"
+    except ImportError:
+        pyaudio = None
+        AUDIO_BACKEND = None
+
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+
+# ---------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------
+
+MODEL_PATH = Path(__file__).with_name("yolo26n.onnx")
+
+IMAGE_SIZE = 640
+CONFIDENCE = 0.35
+IOU_THRESHOLD = 0.45
+MAX_DETECTIONS = 40
+
+LLM_MODEL = os.getenv(
+    "OPENAI_VISION_MODEL",
+    "gpt-4.1-mini"
+)
+
+AUTO_INTERVAL_SECONDS = 25
+JPEG_QUALITY = 75
+
+MIC_DEVICE_INDEX = None
+
+# Experimental research settings (not validated safety thresholds)
+RISK_WEIGHTS = {
+    "proximity": 0.25, "exposure": 0.15,
+    "accessibility": 0.15, "motion": 0.15,
+    "context": 0.10, "human_traffic": 0.20
+}
+# Unvalidated research parameters. Counts are approximate tracked people
+# close to a visible knife, NOT verified hallway crossings.
+TRAFFIC_WINDOW_SECONDS = 30.0
+TRAFFIC_SATURATION_PEOPLE = 10
+TRACK_MAX_AGE_SECONDS = 1.5
+TRACK_MATCH_MAX_DIAGONAL = 0.12
+PERSON_KNIFE_NEAR_DIAGONAL = 0.30
+MIN_KNIFE_FRAMES = 3
+RISK_LOG = Path(__file__).with_name("knife_risk_experiments.jsonl")
+
+
+# ---------------------------------------------------
+# COCO OBJECT LABELS
+# ---------------------------------------------------
+
+COCO = (
+    "person,bicycle,car,motorcycle,airplane,bus,train,"
+    "truck,boat,traffic light,fire hydrant,stop sign,"
+    "parking meter,bench,bird,cat,dog,horse,sheep,cow,"
+    "elephant,bear,zebra,giraffe,backpack,umbrella,"
+    "handbag,tie,suitcase,frisbee,skis,snowboard,"
+    "sports ball,kite,baseball bat,baseball glove,"
+    "skateboard,surfboard,tennis racket,bottle,"
+    "wine glass,cup,fork,knife,spoon,bowl,banana,"
+    "apple,sandwich,orange,broccoli,carrot,hot dog,"
+    "pizza,donut,cake,chair,couch,potted plant,bed,"
+    "dining table,toilet,tv,laptop,mouse,remote,"
+    "keyboard,cell phone,microwave,oven,toaster,"
+    "sink,refrigerator,book,clock,vase,scissors,"
+    "teddy bear,hair drier,toothbrush"
+).split(",")
+
+# ---------------------------------------------------
+# WINDOWS DPI
+# ---------------------------------------------------
+
+def setup_dpi():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+
+# ---------------------------------------------------
+# WINDOWS TEXT TO SPEECH
+# FIX: NEW SPEECH PROCESS FOR EACH RESPONSE
+# ---------------------------------------------------
+
+def speak(words):
+    if not words or not str(words).strip():
+        return False
+
+    print("[VOICE] Starting speech...", flush=True)
+
+    ps_script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+
+$text = [Console]::In.ReadToEnd()
+
+$voice = New-Object System.Speech.Synthesis.SpeechSynthesizer
+
+try {
+    $voice.Rate = 0
+    $voice.Volume = 100
+    $voice.Speak($text)
+}
+finally {
+    $voice.Dispose()
+}
+"""
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                ps_script
+            ],
+            input=str(words),
+            text=True,
+            capture_output=True,
+            timeout=90,
+            check=False,
+            creationflags=getattr(
+                subprocess,
+                "CREATE_NO_WINDOW",
+                0
+            )
+        )
+
+        if result.returncode == 0:
+            print("[VOICE] Speech completed.")
+            return True
+
+        print("[VOICE ERROR]", result.stderr.strip())
+        return False
+
+    except subprocess.TimeoutExpired:
+        print("[VOICE ERROR] Speech timed out.")
+        return False
+
+    except Exception as e:
+        print("[VOICE ERROR]", e)
+        return False
+
+# ---------------------------------------------------
+# MICROPHONE SELECTION
+# ---------------------------------------------------
+
+def select_microphone():
+    global MIC_DEVICE_INDEX
+
+    if sr is None or pyaudio is None:
+        print("[MIC] Install SpeechRecognition and PyAudioWPatch.")
+        return
+
+    try:
+        microphones = sr.Microphone.list_microphone_names()
+
+        print("\nAVAILABLE MICROPHONES")
+
+        for i, name in enumerate(microphones):
+            print(f"{i}: {name}")
+
+        choice = input(
+            "Select microphone index (Enter = default): "
+        ).strip()
+
+        if not choice:
+            MIC_DEVICE_INDEX = None
+            print("[MIC] Windows default microphone selected.")
+            return
+
+        index = int(choice)
+
+        if index < 0 or index >= len(microphones):
+            print("[MIC] Invalid microphone index.")
+            return
+
+        MIC_DEVICE_INDEX = index
+        print(f"[MIC] Selected: {microphones[index]}")
+
+    except Exception as e:
+        print("[MIC ERROR]", e)
+
+# ---------------------------------------------------
+# SPEECH RECOGNITION
+# ---------------------------------------------------
+
+def listen_question():
+    if sr is None or pyaudio is None:
+        print("[MIC] Speech recognition is not available.")
+        return None
+
+    recognizer = sr.Recognizer()
+
+    try:
+        with sr.Microphone(
+            device_index=MIC_DEVICE_INDEX
+        ) as source:
+
+            print("[MIC] Adjusting background noise...")
+
+            recognizer.adjust_for_ambient_noise(
+                source,
+                duration=0.5
+            )
+
+            print("[MIC] Listening... Speak now.")
+
+            audio = recognizer.listen(
+                source,
+                timeout=8,
+                phrase_time_limit=12
+            )
+
+        print("[MIC] Recognizing speech...")
+
+        question = recognizer.recognize_google(audio)
+
+        print(f"[MIC] You said: {question}")
+
+        return question
+
+    except sr.WaitTimeoutError:
+        print("[MIC] No speech detected.")
+
+    except sr.UnknownValueError:
+        print("[MIC] Could not understand your speech.")
+
+    except sr.RequestError as e:
+        print("[MIC] Speech recognition service error:", e)
+
+    except Exception as e:
+        print("[MIC ERROR]", e)
+
+    return None
+
+# ---------------------------------------------------
+# LOAD YOLO26 ONNX RUNTIME
+# ---------------------------------------------------
+
+def init_yolo():
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Missing YOLO model: {MODEL_PATH}\n"
+            "Put yolo26n.onnx beside your Python file."
+        )
+
+    print("[YOLO] Loading model...")
+
+    session = ort.InferenceSession(
+        str(MODEL_PATH),
+        providers=["CPUExecutionProvider"]
+    )
+
+    inp = session.get_inputs()[0]
+
+    if inp.type != "tensor(float)":
+        raise ValueError(
+            f"Unsupported model input type: {inp.type}"
+        )
+
+    shape = inp.shape
+
+    height = (
+        shape[2]
+        if isinstance(shape[2], int)
+        else IMAGE_SIZE
+    )
+
+    width = (
+        shape[3]
+        if isinstance(shape[3], int)
+        else IMAGE_SIZE
+    )
+
+    if height <= 0 or width <= 0:
+        raise ValueError("Invalid YOLO model input size.")
+
+    print("[YOLO] Model loaded.")
+    print("[YOLO] Input:", shape)
+    print(
+        "[YOLO] Output:",
+        [(o.name, o.shape) for o in session.get_outputs()]
+    )
+
+    return session, inp.name, (width, height)
+
+# ---------------------------------------------------
+# LETTERBOX PREPROCESSING
+# ---------------------------------------------------
+
+def letterbox(image, size):
+    target_w, target_h = size
+
+    h, w = image.shape[:2]
+
+    scale = min(
+        target_w / w,
+        target_h / h
+    )
+
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
+
+    resized = cv2.resize(
+        image,
+        (new_w, new_h)
+    )
+
+    dx = (target_w - new_w) // 2
+    dy = (target_h - new_h) // 2
+
+    canvas = np.full(
+        (target_h, target_w, 3),
+        114,
+        dtype=np.uint8
+    )
+
+    canvas[
+        dy:dy + new_h,
+        dx:dx + new_w
+    ] = resized
+
+    return canvas, scale, dx, dy
+
+# ---------------------------------------------------
+# YOLO DETECTION
+# ---------------------------------------------------
+
+def yolo_detect(frame, session, input_name, size):
+    """Detect COCO objects using YOLO26 ONNX.
+
+    Supports either:
+      * YOLO26 end-to-end/NMS-free (N, 300, 6), xyxy + confidence + class
+      * Standard raw predictions (N, 84, 8400), xywh + class probabilities
+    Also accepts legacy 85-column YOLO outputs with objectness.
+    """
+    padded, scale, dx, dy = letterbox(frame, size)
+    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+    blob = np.ascontiguousarray(
+        rgb.transpose(2, 0, 1)[None], dtype=np.float32
+    ) / 255.0
+
+    raw = session.run(None, {input_name: blob})[0]
+    output = np.squeeze(raw)
+    if output.ndim != 2:
+        raise ValueError(f"Unsupported YOLO26 output shape: {raw.shape}")
+
+    # Normalize channel-first matrices to (detections, features).
+    if output.shape[0] in (6, 84, 85) and output.shape[1] > output.shape[0]:
+        output = output.T
+
+    if output.shape[1] == 6:
+        # End-to-end NMS-free output (or embedded NMS): xyxy, score, class_id.
+        # No external NMS: coordinates are already the final detection boxes.
+        xyxy = output[:, :4].astype(np.float32)
+        scores = output[:, 4].astype(np.float32)
+        class_ids = np.rint(output[:, 5]).astype(np.int32)
+        use_nms = False
+    elif output.shape[1] in (84, 85):
+        # Traditional raw output: center-x, center-y, width, height, class scores.
+        if output.shape[1] == 84:
+            class_scores = output[:, 4:]
+            class_ids = np.argmax(class_scores, axis=1)
+            scores = class_scores[np.arange(len(output)), class_ids]
+        else:
+            class_scores = output[:, 5:]
+            class_ids = np.argmax(class_scores, axis=1)
+            scores = (output[:, 4] *
+                      class_scores[np.arange(len(output)), class_ids])
+        cx, cy, bw, bh = output[:, :4].T
+        xyxy = np.column_stack((cx - bw / 2, cy - bh / 2,
+                                cx + bw / 2, cy + bh / 2))
+        use_nms = True
+    else:
+        raise ValueError(
+            f"Unsupported YOLO26 output: {raw.shape}; "
+            "expected (..., 6), (..., 84), or (..., 85)"
+        )
+
+    valid = (np.isfinite(scores) & np.isfinite(xyxy).all(axis=1) &
+             (scores >= CONFIDENCE) &
+             (class_ids >= 0) & (class_ids < len(COCO)))
+    xyxy, scores, class_ids = xyxy[valid], scores[valid], class_ids[valid]
+
+    img_h, img_w = frame.shape[:2]
+    boxes, classes, confidences = [], [], []
+    for (x1, y1, x2, y2), score, cls in zip(xyxy, scores, class_ids):
+        x1 = int(np.clip((x1 - dx) / scale, 0, img_w - 1))
+        y1 = int(np.clip((y1 - dy) / scale, 0, img_h - 1))
+        x2 = int(np.clip((x2 - dx) / scale, 0, img_w - 1))
+        y2 = int(np.clip((y2 - dy) / scale, 0, img_h - 1))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        boxes.append([x1, y1, x2 - x1, y2 - y1])
+        classes.append(int(cls))
+        confidences.append(float(score))
+
+    if use_nms:
+        selected = []
+        for cls in sorted(set(classes)):
+            ids = [i for i, c in enumerate(classes) if c == cls]
+            kept = cv2.dnn.NMSBoxes(
+                [boxes[i] for i in ids],
+                [confidences[i] for i in ids],
+                CONFIDENCE,
+                IOU_THRESHOLD,
+            )
+            if len(kept):
+                selected.extend(ids[int(j)] for j in np.asarray(kept).reshape(-1))
+    else:
+        selected = list(range(len(boxes)))
+
+    selected.sort(key=lambda i: confidences[i], reverse=True)
+    selected = selected[:MAX_DETECTIONS]
+
+    annotated = frame.copy()
+    detections = []
+    for i in selected:
+        x, y, w, h = boxes[i]
+        label = COCO[classes[i]]
+        confidence = confidences[i]
+        detections.append({
+            "label": label,
+            "confidence": round(confidence, 2),
+            "box": [x, y, w, h],
+        })
+        cv2.rectangle(annotated, (x, y), (x+w, y+h), (0, 200, 0), 2)
+        cv2.putText(annotated, f"{label} {confidence:.2f}",
+                    (x, max(20, y - 7)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 240, 0), 2)
+
+    return detections, annotated
+
+# ---------------------------------------------------
+# OPENAI VISION LLM
+# ---------------------------------------------------
+
+def ask_llm(client, frame, detections, question):
+    success, encoded = cv2.imencode(
+        ".jpg",
+        frame,
+        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    )
+
+    if not success:
+        print("[LLM ERROR] Image encoding failed.")
+        return None
+
+    image_base64 = base64.b64encode(
+        encoded.tobytes()
+    ).decode("ascii")
+
+    counts = Counter(
+        d["label"] for d in detections
+    )
+
+    description = ", ".join(
+        f"{count} {label}"
+        for label, count in counts.items()
+    ) or "none"
+
+    print("[LLM] YOLO detections:", description)
+    print("[LLM] Asking OpenAI...")
+
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an assistive AI vision "
+                        "companion using Ray-Ban glasses. "
+                        "You receive a captured image and "
+                        "YOLO object detections. "
+                        "Answer the user's question "
+                        "clearly and naturally. "
+                        "Use the image rather than "
+                        "relying only on YOLO labels. "
+                        "If something is uncertain, "
+                        "say so. "
+                        "Do not invent objects or distances. "
+                        "Do not claim to see continuous video. "
+                        "Do not issue robot commands. "
+                        "Keep your response brief, "
+                        "usually one to three sentences."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Question: {question}\n"
+                                f"YOLO detections: {description}\n"
+                                "Please examine this "
+                                "current camera image."
+                            )
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": (
+                                    "data:image/jpeg;base64,"
+                                    + image_base64
+                                ),
+                                "detail": "low"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=180
+        )
+
+        answer = (
+            response.choices[0].message.content
+            or "No response returned."
+        )
+
+        print("\n[AI]", answer, "\n")
+
+        return answer
+
+    except Exception as e:
+        print("[LLM ERROR]", e)
+        return None
+
+
+# ---------------------------------------------------
+# EXPERIMENTAL KNIFE RISK ASSESSMENT (NO ROBOT)
+# ---------------------------------------------------
+
+def clamp01(value):
+    return max(0.0, min(1.0, float(value)))
+
+
+def center_of(box):
+    x, y, w, h = box
+    return (x + w / 2, y + h / 2)
+
+
+def image_proximity_proxy(knife, people, frame_shape):
+    """Image-space proximity ONLY. Not physical distance."""
+    if not people:
+        return None
+    height, width = frame_shape[:2]
+    diagonal = math.hypot(width, height)
+    distances = [
+        math.dist(center_of(knife["box"]), center_of(p["box"]))
+        / max(diagonal, 1)
+        for p in people
+    ]
+    # Research heuristic: normalized image separation
+    return round(clamp01(1.0 - min(distances) / 0.45), 3)
+
+
+def classify_context(client, frame, detections):
+    """LLM describes visible context, NOT the final risk score."""
+    ok, jpg = cv2.imencode(
+        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    )
+    if not ok:
+        return None
+    encoded = base64.b64encode(jpg.tobytes()).decode("ascii")
+    summary = [
+        {"label": d["label"], "confidence": d["confidence"],
+         "box_xywh": d["box"]}
+        for d in detections
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": (
+                    "Analyze ONE camera snapshot for research. Return ONLY "
+                    "JSON with fields: environment (kitchen, hallway, "
+                    "workspace, other, unknown), knife_surface (floor, "
+                    "counter, table, held, other, unknown), "
+                    "walkway (yes, no, unknown), "
+                    "accessibility (low, medium, high, unknown), "
+                    "explanation (short string). "
+                    "Use unknown when visual evidence is insufficient. "
+                    "Do not infer unseen people, motion, physical distance "
+                    "or future events. Do not give a numerical risk score."
+                )},
+                {"role": "user", "content": [
+                    {"type": "text", "text": (
+                        "YOLO detections (image pixel boxes): "
+                        + json.dumps(summary)
+                    )},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/jpeg;base64," + encoded,
+                        "detail": "low"
+                    }}
+                ]}
+            ],
+            max_tokens=250
+        )
+        data = json.loads(response.choices[0].message.content or "{}")
+        if not isinstance(data, dict):
+            return None
+        allowed = {
+            "environment": {"kitchen", "hallway", "workspace", "other", "unknown"},
+            "knife_surface": {"floor", "counter", "table", "held", "other", "unknown"},
+            "walkway": {"yes", "no", "unknown"},
+            "accessibility": {"low", "medium", "high", "unknown"}
+        }
+        for key, choices in allowed.items():
+            value = str(data.get(key, "unknown")).lower().strip()
+            data[key] = value if value in choices else "unknown"
+        data["explanation"] = str(data.get("explanation", ""))[:350]
+        return data
+    except Exception as exc:
+        print("[RISK] Context analysis unavailable:", exc)
+        return None
+
+
+class HumanTrafficMonitor:
+    """Experimental near-knife person counter for a mostly stationary camera.
+
+    Uses simple centroid matching, NOT a production-grade object tracker.
+    Camera movement, occlusions, and ID switches can change the count.
+    """
+
+    def __init__(self):
+        self.tracks = {}  # track ID -> (center, last_seen)
+        self.next_id = 1
+        self.near_events = {}  # track ID -> most recent time near a visible knife
+        self.knife_frames = deque()  # timestamps when a knife was detected
+
+    def update(self, detections, frame_shape, now=None):
+        now = time.monotonic() if now is None else now
+        fh, fw = frame_shape[:2]
+        diag = max(1.0, math.hypot(fw, fh))
+        people = [d for d in detections if d["label"] == "person"]
+        knives = [d for d in detections if d["label"] == "knife"]
+
+        # Expire old tracks and old rolling-window evidence.
+        self.tracks = {
+            tid: (pt, last) for tid, (pt, last) in self.tracks.items()
+            if now - last <= TRACK_MAX_AGE_SECONDS
+        }
+        while self.knife_frames and now - self.knife_frames[0] > TRAFFIC_WINDOW_SECONDS:
+            self.knife_frames.popleft()
+        self.near_events = {
+            tid: t for tid, t in self.near_events.items()
+            if now - t <= TRAFFIC_WINDOW_SECONDS
+        }
+        if knives:
+            self.knife_frames.append(now)
+
+        # Greedy one-to-one matching. Works best with a steady camera.
+        pairs = []
+        for person_index, person in enumerate(people):
+            pt = center_of(person["box"])
+            for tid, (previous_pt, _) in self.tracks.items():
+                distance = math.dist(pt, previous_pt) / diag
+                if distance <= TRACK_MATCH_MAX_DIAGONAL:
+                    pairs.append((distance, person_index, tid))
+        used_people, used_tracks = set(), set()
+        matches = {}
+        for _, pi, tid in sorted(pairs):
+            if pi not in used_people and tid not in used_tracks:
+                matches[pi] = tid
+                used_people.add(pi)
+                used_tracks.add(tid)
+        for pi, person in enumerate(people):
+            tid = matches.get(pi)
+            if tid is None:
+                tid = self.next_id
+                self.next_id += 1
+            self.tracks[tid] = (center_of(person["box"]), now)
+            # Use bottom-center as approximate ground contact point.
+            x, y, w, h = person["box"]
+            feet = (x + w / 2, y + h)
+            if knives and any(
+                math.dist(feet, center_of(knife["box"])) / diag
+                <= PERSON_KNIFE_NEAR_DIAGONAL for knife in knives
+            ):
+                self.near_events[tid] = now
+
+    def snapshot(self, now=None):
+        now = time.monotonic() if now is None else now
+        self.near_events = {
+            tid: t for tid, t in self.near_events.items()
+            if now - t <= TRAFFIC_WINDOW_SECONDS
+        }
+        while self.knife_frames and now - self.knife_frames[0] > TRAFFIC_WINDOW_SECONDS:
+            self.knife_frames.popleft()
+        count = len(self.near_events)
+        # Not enough observed knife frames: lack of traffic != zero traffic.
+        valid = len(self.knife_frames) >= MIN_KNIFE_FRAMES
+        return {
+            "window_seconds": TRAFFIC_WINDOW_SECONDS,
+            "unique_near_knife_tracks": count,
+            "knife_frames_observed": len(self.knife_frames),
+            "human_traffic": round(min(1.0, count / TRAFFIC_SATURATION_PEOPLE), 3) if valid else None,
+            "method": "approximate image-space track IDs near visible knife; not confirmed passersby",
+            "camera_motion_warning": "Moving glasses, occlusion or ID switches can cause missed/double counts."
+        }
+
+
+def calculate_knife_risk(detections, frame_shape, context, traffic=None):
+    """Unvalidated relative hazard-priority index, not injury likelihood."""
+    knives = [d for d in detections if d["label"] == "knife"]
+    people = [d for d in detections if d["label"] == "person"]
+    if not knives:
+        return {
+            "status": "NO_KNIFE_DETECTED", "risk_score": None,
+            "risk_level": "UNKNOWN", "human_traffic_observation": traffic,
+            "reason": "YOLO did not detect a knife in this snapshot; this does not prove safety."
+        }
+    if context is None:
+        return {
+            "status": "INSUFFICIENT_CONTEXT", "risk_score": None,
+            "risk_level": "UNKNOWN", "human_traffic_observation": traffic,
+            "reason": "Context assessment unavailable."
+        }
+
+    walkway = context["walkway"]
+    surface = context["knife_surface"]
+    accessibility = context["accessibility"]
+    environment = context["environment"]
+    exposure = {"yes": 0.90, "no": 0.15}.get(walkway)
+    access = {"high": 0.90, "medium": 0.50, "low": 0.10}.get(accessibility)
+    context_value = {
+        "hallway": 0.80, "kitchen": 0.25,
+        "workspace": 0.40, "other": 0.50
+    }.get(environment)
+    if surface == "floor" and access is not None:
+        access = max(access, 0.70)
+    # One snapshot cannot determine knife motion. Never substitute zero.
+    motion = None
+    human_traffic = (traffic or {}).get("human_traffic")
+
+    results = []
+    for knife in knives:
+        proximity = image_proximity_proxy(knife, people, frame_shape)
+        factors = {
+            "proximity": proximity, "exposure": exposure,
+            "accessibility": access, "motion": motion,
+            "context": context_value, "human_traffic": human_traffic
+        }
+        known = {k: v for k, v in factors.items() if v is not None}
+        missing = [k for k, v in factors.items() if v is None]
+        observed_weight = sum(RISK_WEIGHTS[k] for k in known)
+        weighted_sum = sum(RISK_WEIGHTS[k] * v for k, v in known.items())
+        observed_index = 100 * weighted_sum / observed_weight if observed_weight else None
+        lower = 100 * weighted_sum
+        upper = lower + 100 * sum(RISK_WEIGHTS[k] for k in missing)
+
+        def band(score):
+            return "HIGH" if score >= 70 else "MODERATE" if score >= 35 else "LOW"
+
+        preliminary_level = band(observed_index) if observed_index is not None else "UNKNOWN"
+        interval_level = band(lower) if band(lower) == band(upper) else "UNKNOWN"
+        results.append({
+            "knife_box": knife["box"], "knife_confidence": knife["confidence"],
+            "factors": factors, "missing_factors": missing,
+            "observed_factor_index": round(observed_index, 1) if observed_index is not None else None,
+            "observed_weight_fraction": round(observed_weight, 2),
+            "risk_interval": [round(lower, 1), round(upper, 1)],
+            "preliminary_risk_level": preliminary_level,
+            "risk_level": interval_level
+        })
+
+    def aggregate(field):
+        levels = [r[field] for r in results]
+        return ("HIGH" if "HIGH" in levels else
+                "UNKNOWN" if "UNKNOWN" in levels else
+                "MODERATE" if "MODERATE" in levels else "LOW")
+
+    return {
+        "status": "EXPERIMENTAL_ESTIMATE", "risk_score": None,
+        "risk_level": aggregate("risk_level"),
+        "preliminary_risk_level": aggregate("preliminary_risk_level"),
+        "person_count_detected": len(people),
+        "human_traffic_observation": traffic,
+        "context": context, "knives": results,
+        "reason": "Unvalidated relative hazard-priority index, not injury probability or safety certification."
+    }
+
+
+def log_knife_risk(result):
+    record = {"timestamp_utc": datetime.now(timezone.utc).isoformat(),
+              "assessment": result}
+    with RISK_LOG.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print("[RISK] Saved:", RISK_LOG)
+
+
+def describe_knife_danger(result):
+    """Explain visible danger without pretending a snapshot proves safety."""
+    status = result.get("status")
+    if status == "NO_KNIFE_DETECTED":
+        return ("Knife danger cannot be assessed: the detector did not recognize "
+                "a knife in this frame. This does not mean the scene is safe.")
+    if status == "INSUFFICIENT_CONTEXT":
+        return ("A knife was detected, but scene context could not be analyzed. "
+                "Danger is unknown. Check your OpenAI API key and connectivity.")
+
+    context = result.get("context") or {}
+    knives = result.get("knives") or []
+    level = result.get("risk_level", "UNKNOWN")
+    preliminary = result.get("preliminary_risk_level", "UNKNOWN")
+    traffic = result.get("human_traffic_observation") or {}
+    details = []
+    surface = context.get("knife_surface", "unknown")
+    walkway = context.get("walkway", "unknown")
+    access = context.get("accessibility", "unknown")
+    people = result.get("person_count_detected", 0)
+
+    if surface == "floor":
+        details.append("the knife appears to be on the floor")
+    elif surface == "held":
+        details.append("the knife appears to be held")
+    elif surface in ("table", "counter"):
+        details.append(f"the knife appears to be on a {surface}")
+    if walkway == "yes":
+        details.append("it appears to be in a walkway")
+    if access in ("low", "medium", "high"):
+        details.append(f"accessibility appears {access}")
+    if people:
+        details.append(f"{people} person detection(s) appear in the frame")
+    if traffic.get("human_traffic") is not None:
+        details.append(f"approximately {traffic['unique_near_knife_tracks']} unique person track(s) near the knife in the last 30 seconds")
+    else:
+        details.append("human-traffic estimate unavailable: insufficient knife observations")
+
+    evidence = "; ".join(details) if details else "visual context is limited"
+    if knives:
+        ranges = [r.get("risk_interval") for r in knives]
+        ranges = [r for r in ranges if r and len(r) == 2]
+        interval_text = (f" Prototype index range: {min(r[0] for r in ranges):.0f}"
+                         f" to {max(r[1] for r in ranges):.0f} out of 100."
+                         if ranges else "")
+    else:
+        interval_text = ""
+    return (f"Experimental knife danger classification: {level}. "
+            f"Preliminary observed-factor level: {preliminary}. "
+            f"Visible evidence: {evidence}."
+            f"{interval_text} Motion, real-world distance, and blade sharpness "
+            "cannot be established from one camera image. "
+            "This is not a safety clearance.")
+
+
+def draw_risk_overlay(frame, result):
+    if result is None:
+        return
+    level = result.get("risk_level", "UNKNOWN")
+    color = {"LOW": (0, 180, 0), "MODERATE": (0, 180, 255),
+             "HIGH": (0, 0, 255)}.get(level, (180, 180, 180))
+    cv2.rectangle(frame, (8, 65), (min(frame.shape[1] - 1, 440), 105),
+                  (25, 25, 25), -1)
+    cv2.putText(frame, "KNIFE RISK: " + level + " (experimental)",
+                (14, 91), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+# ---------------------------------------------------
+# SCREEN CAPTURE REGION
+# ---------------------------------------------------
+
+def select_capture_region(sct):
+    monitors = sct.monitors[1:]
+
+    print("\nAVAILABLE MONITORS")
+
+    for i, monitor in enumerate(monitors, 1):
+        print(i, monitor)
+
+    choice = input(
+        "Monitor containing Ray-Ban video [1]: "
+    ).strip()
+
+    index = int(choice) if choice else 1
+
+    if not 1 <= index <= len(monitors):
+        raise ValueError("Invalid monitor number.")
+
+    monitor = monitors[index - 1]
+
+    screenshot = np.asarray(
+        sct.grab(monitor)
+    )
+
+    screen = cv2.cvtColor(
+        screenshot,
+        cv2.COLOR_BGRA2BGR
+    )
+
+    window_name = "SELECT RAY-BAN VIDEO REGION"
+
+    x, y, w, h = cv2.selectROI(
+        window_name,
+        screen,
+        showCrosshair=True,
+        fromCenter=False
+    )
+
+    cv2.destroyWindow(window_name)
+
+    if w < 2 or h < 2:
+        raise RuntimeError(
+            "No capture region selected."
+        )
+
+    return {
+        "left": monitor["left"] + int(x),
+        "top": monitor["top"] + int(y),
+        "width": int(w),
+        "height": int(h)
+    }
+
+# ---------------------------------------------------
+# MAIN APPLICATION
+# ---------------------------------------------------
+
+def main():
+    setup_dpi()
+
+    print("=" * 55)
+    print("RAY-BAN META + YOLO26 + OPENAI LLM + VOICE")
+    print("=" * 55)
+
+    print("[SAFETY] Epson VT6 movement DISABLED")
+
+    session, input_name, size = init_yolo()
+
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if api_key:
+        client = OpenAI(api_key=api_key)
+        print("[LLM] OpenAI client initialized.")
+    else:
+        client = None
+        print("[LLM] OPENAI_API_KEY missing.")
+
+    print("[MIC] Backend:", AUDIO_BACKEND)
+
+    print("""
+KEYBOARD CONTROLS
+
+S = Describe scene
+T = Type a question
+V = Ask with microphone
+M = Select microphone
+A = Toggle automatic narration
+B = Test repeated speech
+K = Assess knife risk (snapshot + 30s near-knife human traffic)
+Q = Quit
+""")
+
+    automatic = False
+    traffic_monitor = HumanTrafficMonitor()
+    last_auto = time.monotonic()
+    last_log = 0
+    last_risk_result = None
+
+    window_name = "Ray-Ban YOLO + OpenAI + Voice"
+
+    with mss.mss() as sct:
+        region = select_capture_region(sct)
+
+        print("[CAPTURE]", region)
+
+        cv2.namedWindow(
+            window_name,
+            cv2.WINDOW_NORMAL
+        )
+
+        try:
+            while True:
+                screenshot = np.asarray(
+                    sct.grab(region)
+                )
+
+                frame = cv2.cvtColor(
+                    screenshot,
+                    cv2.COLOR_BGRA2BGR
+                )
+
+                try:
+                    detections, annotated = yolo_detect(
+                        frame,
+                        session,
+                        input_name,
+                        size
+                    )
+                except Exception as e:
+                    print("[YOLO ERROR]", e)
+                    break
+
+                cv2.putText(
+                    annotated,
+                    "S:Scene T:Type V:Voice M:Mic "
+                    "A:Auto B:Test K:Risk Q:Quit",
+                    (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 255),
+                    2
+                )
+
+                if automatic:
+                    cv2.putText(
+                        annotated,
+                        "AUTO ON",
+                        (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 255),
+                        2
+                    )
+
+                traffic_monitor.update(detections, frame.shape)
+                traffic_data = traffic_monitor.snapshot()
+                cv2.putText(
+                    annotated,
+                    f"Near-knife tracks (30s): {traffic_data['unique_near_knife_tracks']} "
+                    f"({'ready' if traffic_data['human_traffic'] is not None else 'collecting'})",
+                    (10, min(140, annotated.shape[0] - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1
+                )
+                draw_risk_overlay(annotated, last_risk_result)
+
+                h, w = annotated.shape[:2]
+
+                scale = min(
+                    1.0,
+                    1100 / w,
+                    750 / h
+                )
+
+                if scale < 1:
+                    preview = cv2.resize(
+                        annotated,
+                        None,
+                        fx=scale,
+                        fy=scale
+                    )
+                else:
+                    preview = annotated
+
+                cv2.imshow(
+                    window_name,
+                    preview
+                )
+
+                now = time.monotonic()
+
+                if now - last_log >= 5:
+                    counts = Counter(
+                        d["label"] for d in detections
+                    )
+
+                    print(
+                        "[YOLO]",
+                        dict(counts)
+                        if counts
+                        else "No objects detected"
+                    )
+
+                    last_log = now
+
+                pressed = cv2.waitKey(1) & 0xFF
+
+                question = None
+
+                if pressed in (ord("q"), 27):
+                    break
+
+                elif pressed == ord("b"):
+                    speak(
+                        "Hello. This is a speech test. "
+                        "I can speak every time "
+                        "you press the B key."
+                    )
+
+                elif pressed == ord("k"):
+                    fresh = np.asarray(sct.grab(region))
+                    risk_frame = cv2.cvtColor(fresh, cv2.COLOR_BGRA2BGR)
+                    risk_detections, _ = yolo_detect(
+                        risk_frame, session, input_name, size
+                    )
+                    traffic_monitor.update(risk_detections, risk_frame.shape)
+                    traffic_snapshot = traffic_monitor.snapshot()
+                    if not any(d["label"] == "knife" for d in risk_detections):
+                        last_risk_result = calculate_knife_risk(
+                            risk_detections, risk_frame.shape, None, traffic_snapshot
+                        )
+                    else:
+                        risk_context = (
+                            classify_context(client, risk_frame, risk_detections)
+                            if client is not None else None
+                        )
+                        last_risk_result = calculate_knife_risk(
+                            risk_detections, risk_frame.shape, risk_context, traffic_snapshot
+                        )
+                    print("[RISK]", json.dumps(last_risk_result, indent=2))
+                    risk_message = describe_knife_danger(last_risk_result)
+                    print("[KNIFE DANGER]", risk_message, flush=True)
+                    log_knife_risk(last_risk_result)
+                    speak(risk_message)
+
+                elif pressed == ord("s"):
+                    question = (
+                        "What objects do you see, "
+                        "and where are they?"
+                    )
+
+                elif pressed == ord("t"):
+                    question = input(
+                        "\nYour question: "
+                    ).strip()
+
+                elif pressed == ord("v"):
+                    question = listen_question()
+
+                elif pressed == ord("m"):
+                    select_microphone()
+
+                elif pressed == ord("a"):
+                    automatic = not automatic
+
+                    last_auto = time.monotonic()
+
+                    print(
+                        "[AUTO]",
+                        "ON" if automatic else "OFF"
+                    )
+
+                if (
+                    automatic
+                    and time.monotonic() - last_auto
+                    >= AUTO_INTERVAL_SECONDS
+                ):
+                    if not question:
+                        question = (
+                            "Describe the current "
+                            "scene briefly."
+                        )
+
+                    last_auto = time.monotonic()
+
+                if question:
+                    if client is None:
+                        print(
+                            "[LLM] Configure "
+                            "OPENAI_API_KEY first."
+                        )
+                    else:
+                        # Capture a fresh frame after
+                        # listening or typing.
+                        fresh = np.asarray(
+                            sct.grab(region)
+                        )
+
+                        latest_frame = cv2.cvtColor(
+                            fresh,
+                            cv2.COLOR_BGRA2BGR
+                        )
+
+                        latest_detections, _ = yolo_detect(
+                            latest_frame,
+                            session,
+                            input_name,
+                            size
+                        )
+
+                        answer = ask_llm(
+                            client,
+                            latest_frame,
+                            latest_detections,
+                            question
+                        )
+
+                        if answer:
+                            print(
+                                "[VOICE] Sending AI "
+                                "answer to speaker..."
+                            )
+
+                            speak(answer)
+
+        finally:
+            cv2.destroyAllWindows()
+
+    print("[INFO] Program stopped.")
+    print("[SAFETY] No robot movement was executed.")
+
+
+if __name__ == "__main__":
+    main()
